@@ -27,6 +27,13 @@ export type ProviderOptions = {
   hide?: string | string[]
   /** Regexes that un-hide a model already matched by `hide`. They do not hide anything else. */
   show?: string | string[]
+  /**
+   * Effort levels offered as variants on reasoning models, sent as `reasoning_effort`.
+   * Defaults to the levels models.dev lists for each model (else `["low", "medium", "high"]`); `false` turns variants off.
+   */
+  effort?: string[] | false
+  /** Regexes of models that get effort levels even when models.dev does not flag them as reasoning models. */
+  reasoning?: string | string[]
 }
 
 export type Options = { providers?: Record<string, ProviderOptions> }
@@ -39,6 +46,8 @@ export type CatalogModel = {
   name?: string
   family?: string
   tool_call?: boolean
+  reasoning?: boolean
+  reasoning_options?: Array<{ type?: string; values?: string[] }>
   release_date?: string
   modalities?: { input?: string[]; output?: string[] }
   limit?: { context?: number; input?: number; output?: number }
@@ -51,6 +60,7 @@ const CATALOG_URL = "https://models.dev/api.json"
 const CATALOG_TTL = 6 * 60 * 60 * 1000
 const ENV = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g
 const MAX_REDIRECTS = 5
+const DEFAULT_EFFORT = ["low", "medium", "high"]
 const asArray = (value?: string | string[]) => (value === undefined ? [] : Array.isArray(value) ? value : [value])
 
 /** Replace `{env:NAME}` with the matching environment variable, or nothing when unset. */
@@ -184,6 +194,30 @@ export function keep(model: { id: string; name: string }, filter: { hide: RegExp
 
 const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined)
 
+/** Effort variants for a reasoning model, in the order given. Blank and repeated levels are dropped. */
+export function effortVariants(levels: readonly string[]): Model.Info["variants"] {
+  return [...new Set(levels.map((level) => level.trim()).filter(Boolean))].map((level) => ({
+    id: Model.VariantID.make(level),
+    body: { reasoning_effort: level },
+  })) as unknown as Model.Info["variants"]
+}
+
+/**
+ * Effort levels models.dev lists for a model, without `none` (that switches reasoning off, it is not a level).
+ * `undefined` when the entry says nothing; an empty list when it only offers a toggle or a token budget.
+ */
+export function catalogEfforts(catalog?: CatalogModel): string[] | undefined {
+  const options = catalog?.reasoning_options
+  if (!options?.length) return undefined
+  const values = options.flatMap((option) => (option.type === "effort" ? (option.values ?? []) : []))
+  const levels = [...new Set(values.filter((value) => value !== "none"))]
+  // A single level is not a choice.
+  return levels.length > 1 ? levels : []
+}
+
+/** Per-provider effort settings. `levels` is the explicit override; `disabled` turns variants off. */
+export type Effort = { levels?: readonly string[]; disabled?: boolean; force: RegExp[] }
+
 /** Map one discovered model onto an OpenCode model, overlaying a models.dev entry when there is one. */
 export function toModel(
   providerID: Provider.ID,
@@ -191,8 +225,15 @@ export function toModel(
   prefix: string,
   catalog?: CatalogModel,
   id = displayId(String(raw.id)),
+  effort?: Effort,
 ): Model.Info {
   const upstream = String(raw.id)
+  const forced = !!effort?.force.some((pattern) => pattern.test(upstream) || pattern.test(String(raw.name ?? upstream)))
+  const listed = catalogEfforts(catalog)
+  // models.dev wins over the default list; a toggle-only entry gets no levels unless the user forced it.
+  const fallback = listed?.length ? listed : listed && !forced ? [] : DEFAULT_EFFORT
+  const levels = !effort || effort.disabled ? [] : (effort.levels ?? fallback)
+  const reasoning = levels.length > 0 && (catalog?.reasoning === true || forced)
   const base = Model.Info.default(providerID, Model.ID.make(id))
   const context = catalog?.limit?.context ?? count(raw.context_length ?? raw.context_window ?? raw.max_context_tokens)
   const output = catalog?.limit?.output ?? count(raw.max_output_tokens ?? raw.max_completion_tokens)
@@ -214,6 +255,7 @@ export function toModel(
       output: output ?? base.limit.output,
       ...(catalog?.limit?.input ? { input: catalog.limit.input } : {}),
     },
+    ...(reasoning ? { variants: effortVariants(levels) } : {}),
     time: { released: Number.isFinite(released) ? released : base.time.released },
     cost: priced(price) ?? base.cost,
   }
@@ -227,12 +269,26 @@ function priced(cost: CatalogModel["cost"]): Model.Info["cost"] | undefined {
 /** Index models.dev by normalized id. A priced entry beats an unpriced one for the same id. */
 export function indexCatalog(api: Record<string, { models?: Record<string, CatalogModel> }>): Map<string, CatalogModel> {
   const index = new Map<string, CatalogModel>()
+  const votes = new Map<string, Map<string, { count: number; levels: string[] }>>()
   for (const provider of Object.values(api)) {
     for (const [id, model] of Object.entries(provider.models ?? {})) {
       const key = matchKey(model.id ?? id)
       const previous = index.get(key)
       if (!previous || score(model) > score(previous)) index.set(key, model)
+      if (model.reasoning_options?.some((option) => option.type === "effort")) {
+        const levels = catalogEfforts(model) ?? []
+        const ballot = votes.get(key) ?? new Map()
+        const entry = ballot.get(levels.join(",")) ?? { count: 0, levels }
+        ballot.set(levels.join(","), { ...entry, count: entry.count + 1 })
+        votes.set(key, ballot)
+      }
     }
+  }
+  // Hosts disagree on a model's effort levels, so use the most common list. A tie says nothing.
+  for (const [key, ballot] of votes) {
+    const ranked = [...ballot.values()].sort((a, b) => b.count - a.count)
+    const winner = ranked[0]!.count > (ranked[1]?.count ?? 0) ? ranked[0]!.levels : undefined
+    index.set(key, { ...index.get(key)!, reasoning_options: winner ? [{ type: "effort", values: winner }] : undefined })
   }
   return index
 }
@@ -308,6 +364,11 @@ async function load(
   const providerID = Provider.ID.make(id)
   const prefix = options.prefix ?? prefixOf(options.name ?? id)
   const filter = { hide: compile(asArray(options.hide)), show: compile(asArray(options.show)) }
+  const effort: Effort = {
+    levels: options.effort === false ? undefined : options.effort,
+    disabled: options.effort === false,
+    force: compile(asArray(options.reasoning)),
+  }
   const timeout = AbortSignal.timeout(30_000)
   const secrets = [apiKey, ...Object.values(options.headers ?? {})]
   let response: Response
@@ -335,7 +396,7 @@ async function load(
       let slug = displayId(String(entry.id))
       if (used.has(slug)) slug = `${slug}-${used.size}`
       used.add(slug)
-      return toModel(providerID, entry, prefix, known.get(matchKey(String(entry.id))), slug)
+      return toModel(providerID, entry, prefix, known.get(matchKey(String(entry.id))), slug, effort)
     })
   if (!models.length) throw new Error("no models left, check your hide/show patterns")
 

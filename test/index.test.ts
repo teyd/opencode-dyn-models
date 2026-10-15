@@ -3,12 +3,15 @@ import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import { Provider } from "@opencode/plugin"
+import type { Effort } from "../src/index.js"
 import {
   cachePath,
+  catalogEfforts,
   credentialEnvNames,
   credentialFor,
   displayId,
   displayName,
+  effortVariants,
   indexCatalog,
   keep,
   loadCatalog,
@@ -93,6 +96,57 @@ test("toModel keeps the upstream id and overlays models.dev", () => {
   expect(Number(model.cost[0]?.cache.write)).toBe(0)
   expect(model.capabilities.tools).toBe(true)
   expect(model.time.released).toBe(Date.parse("2026-06-09"))
+})
+
+test("reasoning models get effort variants that set reasoning_effort", () => {
+  const providerID = Provider.ID.make("commandcode")
+  const effort = { levels: ["low", "high"], force: [/luna/i] }
+  const variants = (model: ReturnType<typeof toModel>) => model.variants.map((variant) => [String(variant.id), variant.body])
+
+  const flagged = toModel(providerID, { id: "deepseek/r2" }, "CC", { reasoning: true }, "r2", effort)
+  expect(variants(flagged)).toEqual([
+    ["low", { reasoning_effort: "low" }],
+    ["high", { reasoning_effort: "high" }],
+  ])
+
+  const forced = toModel(providerID, { id: "gpt-6-luna" }, "CC", undefined, "gpt-6-luna", effort)
+  expect(forced.variants).toHaveLength(2)
+
+  const plain = toModel(providerID, { id: "qwen/plain" }, "CC", { reasoning: false }, "plain", effort)
+  expect(plain.variants).toEqual([])
+
+  const off = toModel(providerID, { id: "deepseek/r2" }, "CC", { reasoning: true }, "r2", { disabled: true, force: [] })
+  expect(off.variants).toEqual([])
+
+  expect(toModel(providerID, { id: "deepseek/r2" }, "CC", { reasoning: true }).variants).toEqual([])
+  expect(effortVariants(["high", " high ", "", "max"]).map((variant) => String(variant.id))).toEqual(["high", "max"])
+})
+
+test("effort levels come from models.dev reasoning_options", () => {
+  const providerID = Provider.ID.make("commandcode")
+  const ids = (model: ReturnType<typeof toModel>) => model.variants.map((variant) => String(variant.id))
+  const make = (catalog: Parameters<typeof toModel>[3], effort: Effort = { force: [] }) =>
+    toModel(providerID, { id: "deepseek/deepseek-v4.1-flash" }, "CC", catalog, "deepseek-v4.1-flash", effort)
+
+  const deepseek = { reasoning: true, reasoning_options: [{ type: "toggle" }, { type: "effort", values: ["none", "low", "high", "max"] }] }
+  expect(catalogEfforts(deepseek)).toEqual(["low", "high", "max"])
+  expect(ids(make(deepseek))).toEqual(["low", "high", "max"])
+  expect(make(deepseek).variants.at(-1)?.body).toEqual({ reasoning_effort: "max" })
+
+  expect(ids(make({ reasoning: true, reasoning_options: [] }))).toEqual(["low", "medium", "high"])
+  expect(ids(make({ reasoning: true }))).toEqual(["low", "medium", "high"])
+  expect(ids(make({ reasoning: true, reasoning_options: [{ type: "toggle" }] }))).toEqual([])
+  expect(ids(make({ reasoning: true, reasoning_options: [{ type: "toggle" }] }, { force: [/deepseek/] }))).toEqual(["low", "medium", "high"])
+  expect(catalogEfforts({ reasoning_options: [{ type: "effort", values: ["none", "high"] }] })).toEqual([])
+  expect(ids(make(deepseek, { levels: ["high", "xhigh"], force: [] }))).toEqual(["high", "xhigh"])
+})
+
+test("indexCatalog takes the most common effort list across hosts", () => {
+  const host = (...values: string[]) => ({ models: { "deepseek/v4": { reasoning: true, reasoning_options: [{ type: "effort", values }] } } })
+  const pick = (api: Parameters<typeof indexCatalog>[0]) => catalogEfforts(indexCatalog(api).get("v4"))
+  expect(pick({ a: host("none", "low", "high", "max"), b: host("low", "high", "max"), c: host("low", "high", "xhigh") })).toEqual(["low", "high", "max"])
+  expect(pick({ a: host("low", "high", "max"), b: host("low", "medium", "high") })).toBeUndefined()
+  expect(pick({ a: host("low", "high", "max") })).toEqual(["low", "high", "max"])
 })
 
 test("indexCatalog prefers the priced entry for one normalized id", () => {
