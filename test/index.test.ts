@@ -13,7 +13,10 @@ import {
   keep,
   loadCatalog,
   matchKey,
+  nextSameOrigin,
+  pinnedFetch,
   prefixOf,
+  redact,
   readCache,
   resolveEnv,
   toModel,
@@ -144,6 +147,37 @@ test("credentialFor does not replace a stored OAuth connection with the option",
       { baseURL: "http://127.0.0.1", apiKey: "plain" },
     ),
   ).rejects.toThrow("OAuth")
+})
+
+test("redirects stay on the base origin", () => {
+  expect(nextSameOrigin("https://api.commandcode.ai/provider/v1/models", "/provider/v1/models")).toBe(
+    "https://api.commandcode.ai/provider/v1/models",
+  )
+  expect(() => nextSameOrigin("https://api.commandcode.ai/provider/v1/models", "https://evil.example/models")).toThrow(
+    "evil.example",
+  )
+})
+
+test("pinnedFetch follows a same-origin redirect and refuses another origin", async () => {
+  const calls: string[] = []
+  const fake = (async (url: string) => {
+    calls.push(String(url))
+    if (calls.length === 1) return new Response(null, { status: 302, headers: { location: "/v1/models" } })
+    return new Response("[]", { status: 200 })
+  }) as unknown as typeof fetch
+  const ok = await pinnedFetch("https://api.commandcode.ai/provider/models", {}, fake)
+  expect(ok.status).toBe(200)
+  expect(calls[1]).toBe("https://api.commandcode.ai/v1/models")
+
+  const cross = (async () => new Response(null, { status: 302, headers: { location: "https://evil.example/x" } })) as unknown as typeof fetch
+  await expect(pinnedFetch("https://api.commandcode.ai/models", {}, cross)).rejects.toThrow("evil.example")
+})
+
+test("redact strips bearer tokens and known secrets", () => {
+  expect(redact("Authorization: Bearer sk-live-secret failed sk-live-secret", ["sk-live-secret"])).toBe(
+    "Authorization: Bearer [redacted] failed [redacted]",
+  )
+  expect(redact("short", ["ab"])).toBe("short")
 })
 
 test("cachePath honours XDG_CACHE_HOME", () => {

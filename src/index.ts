@@ -50,6 +50,7 @@ const CATALOG_URL = "https://models.dev/api.json"
 /** How long a cached models.dev catalog is reused before a refetch. */
 const CATALOG_TTL = 6 * 60 * 60 * 1000
 const ENV = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g
+const MAX_REDIRECTS = 5
 const asArray = (value?: string | string[]) => (value === undefined ? [] : Array.isArray(value) ? value : [value])
 
 /** Replace `{env:NAME}` with the matching environment variable, or nothing when unset. */
@@ -85,7 +86,7 @@ export async function credentialFor(
   try {
     connection = await integration.connection.active(id)
   } catch (error) {
-    console.warn(`[dyn-models] ${id}: could not read the active connection: ${(error as Error).message}`)
+    warn(`${id}: could not read the active connection: ${(error as Error).message}`)
     return fallback
   }
   if (!connection) return fallback
@@ -100,7 +101,7 @@ export async function credentialFor(
   } catch (error) {
     // A stored connection is authoritative: never fall back to another credential for it.
     if (connection.type === "credential") throw error
-    console.warn(`[dyn-models] ${id}: could not resolve the active connection: ${(error as Error).message}`)
+    warn(`${id}: could not resolve the active connection: ${(error as Error).message}`)
   }
   return fallback
 }
@@ -130,12 +131,46 @@ export function displayName(prefix: string, id: string) {
   return `[${prefix}] ${id}`
 }
 
+/** Next URL for a redirect, or an error when it leaves the current origin. */
+export function nextSameOrigin(current: string, location: string): string {
+  const next = new URL(location, current)
+  if (next.origin !== new URL(current).origin) throw new Error(`refusing cross-origin redirect to ${next.origin}`)
+  return next.href
+}
+
+/** `fetch` that follows only same-origin redirects. */
+export async function pinnedFetch(url: string, init: RequestInit = {}, fetchImpl: typeof fetch = fetch): Promise<Response> {
+  let current = url
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const response = await fetchImpl(current, { ...init, redirect: "manual" })
+    if (response.status < 300 || response.status >= 400) return response
+    const location = response.headers.get("location")
+    if (!location) throw new Error("redirect missing location")
+    current = nextSameOrigin(current, location)
+  }
+  throw new Error("too many redirects")
+}
+
+/** Replace bearer tokens and known secrets so a log line cannot carry a key. */
+export function redact(message: string, secrets: Iterable<string | undefined> = []): string {
+  let out = message.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+  for (const secret of secrets) {
+    if (!secret || secret.length < 8) continue
+    out = out.split(secret).join("[redacted]")
+  }
+  return out
+}
+
+function warn(message: string, secrets?: Iterable<string | undefined>) {
+  console.warn(`[dyn-models] ${redact(message, secrets)}`)
+}
+
 function compile(patterns: string[]): RegExp[] {
   return patterns.flatMap((pattern) => {
     try {
       return [new RegExp(pattern, "i")]
     } catch (error) {
-      console.warn(`[dyn-models] ignoring invalid pattern ${JSON.stringify(pattern)}: ${(error as Error).message}`)
+      warn(`ignoring invalid pattern ${JSON.stringify(pattern)}: ${(error as Error).message}`)
       return []
     }
   })
@@ -245,15 +280,13 @@ export async function loadCatalog(file: string, now = Date.now()): Promise<Map<s
   const cached = readCache(file)
   if (cached && now - cached.timestamp <= CATALOG_TTL) return indexCatalog(cached.data)
   try {
-    const response = await fetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
+    const response = await pinnedFetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
     const data = (await response.json()) as CatalogApi
     writeCache(file, data, now)
     return indexCatalog(data)
   } catch (error) {
-    console.warn(
-      `[dyn-models] models.dev unavailable, using ${cached ? "cached" : "no"} metadata: ${(error as Error).message}`,
-    )
+    warn(`models.dev unavailable, using ${cached ? "cached" : "no"} metadata: ${(error as Error).message}`)
     return cached ? indexCatalog(cached.data) : new Map()
   }
 }
@@ -268,7 +301,7 @@ async function load(
   const credential = await credentialFor(integration, id, options)
   const apiKey = credential.key
   if (!apiKey && options.apiKey) {
-    console.warn(`[dyn-models] ${id}: ${options.apiKey} is not set and no connection is active, skipping`)
+    warn(`${id}: ${options.apiKey} is not set and no connection is active, skipping`)
     return undefined
   }
 
@@ -276,14 +309,20 @@ async function load(
   const prefix = options.prefix ?? prefixOf(options.name ?? id)
   const filter = { hide: compile(asArray(options.hide)), show: compile(asArray(options.show)) }
   const timeout = AbortSignal.timeout(30_000)
-  const response = await fetch(`${options.baseURL.replace(/\/+$/, "")}/models`, {
-    headers: {
-      accept: "application/json",
-      ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-      ...options.headers,
-    },
-    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-  })
+  const secrets = [apiKey, ...Object.values(options.headers ?? {})]
+  let response: Response
+  try {
+    response = await pinnedFetch(`${options.baseURL.replace(/\/+$/, "")}/models`, {
+      headers: {
+        accept: "application/json",
+        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        ...options.headers,
+      },
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    })
+  } catch (error) {
+    throw new Error(redact((error as Error).message, secrets))
+  }
   if (!response.ok) throw new Error(`models request failed: ${response.status} ${response.statusText}`)
 
   const body = (await response.json()) as { data?: unknown[] } | unknown[]
@@ -320,7 +359,7 @@ export default Plugin.define({
   async setup(ctx) {
     const entries = Object.entries((ctx.options.providers ?? {}) as Record<string, ProviderOptions>)
     if (!entries.length) {
-      console.warn("[dyn-models] no providers configured, add options.providers to the plugin entry")
+      warn("no providers configured, add options.providers to the plugin entry")
       return
     }
 
@@ -356,7 +395,7 @@ export default Plugin.define({
         const results = await Promise.all(
           entries.map(([id, options]) =>
             load(ctx.integration, id, options, known, abort.signal).catch((error: Error) => {
-              console.warn(`[dyn-models] ${id}: ${error.message}`)
+              warn(`${id}: ${error.message}`)
               return undefined
             }),
           ),
@@ -366,7 +405,7 @@ export default Plugin.define({
         console.log(`[dyn-models] ${loaded.map(({ info, models }) => `${info.id}: ${models.length} models`).join(", ")}`)
         await ctx.provider.reload()
       } catch (error) {
-        console.warn(`[dyn-models] discovery failed: ${(error as Error).message}`)
+        warn(`discovery failed: ${(error as Error).message}`)
       }
     })()
 

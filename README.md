@@ -33,4 +33,4 @@ The plugin path must be a directory (OpenCode loads its `index.ts`).
 
 The key comes from `/connect` or `opencode auth login <id> --method key` when that account is active. Otherwise it comes from the env method (`{env:NAME}` in `apiKey`, or `OPENCODE_LOCAL_<ID>_API_KEY`). `apiKey` is only the fallback.
 
-A provider whose key is unset, or whose `/models` call fails, is skipped. models.dev being down only means names still appear, without prices.
+A provider whose key is unset, or whose `/models` call fails, is skipped. A redirect off the provider's origin is refused. models.dev being down only means names still appear, without prices.
