@@ -4,14 +4,16 @@ OpenCode v2 plugin. On startup it fetches each provider's model list, hides what
 
 Model names look like `[CC] deepseek-v4.1-flash`. The id sent to the provider stays the upstream id.
 
-The plugin path must be a directory (OpenCode loads its `index.ts`).
+## Install
+
+Point `opencode.json(c)` at the Git package; OpenCode installs it on startup. The spec must resolve to a directory (OpenCode loads its `index.ts`), which GitHub, npm, and local paths all do.
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "/absolute/path/opencode-dyn-models",
+      "package": "github:teyd/opencode-dyn-models",
       "options": {
         "providers": {
           "commandcode": {
@@ -27,6 +29,12 @@ The plugin path must be a directory (OpenCode loads its `index.ts`).
     }
   ]
 }
+```
+
+Then log in for the provider you configured. Together with the `opencode.json` entry above, this stores the key and lets the plugin discover its models:
+
+```sh
+opencode auth login commandcode --method key
 ```
 
 `show` only brings back a model that `hide` removed. `hide: ["^gpt-"]` and `show: ["luna"]` drops the other GPT models and still lists DeepSeek. `prefix` defaults to the initials of `name` (`Command Code` → `CC`).
