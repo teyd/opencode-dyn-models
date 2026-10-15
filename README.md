@@ -31,6 +31,8 @@ Point `opencode.json(c)` at the Git package; OpenCode installs it on startup. Th
 }
 ```
 
+Append `#<commit>` to pin a reviewed revision: branches and tags still track the remote, so only a full commit hash (or an exact npm version) stays put. Bump it when you mean to pick up a new release.
+
 Then log in for the provider you configured. Together with the `opencode.json` entry above, this stores the key and lets the plugin discover its models:
 
 ```sh
