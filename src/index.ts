@@ -1,3 +1,6 @@
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
 import { Model, Plugin, Provider } from "@opencode/plugin"
 
 /**
@@ -44,6 +47,8 @@ export type CatalogModel = {
 
 const DEFAULT_PACKAGE = "@opencode/ai/providers/openai-compatible"
 const CATALOG_URL = "https://models.dev/api.json"
+/** How long a cached models.dev catalog is reused before a refetch. */
+const CATALOG_TTL = 6 * 60 * 60 * 1000
 const ENV = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g
 const asArray = (value?: string | string[]) => (value === undefined ? [] : Array.isArray(value) ? value : [value])
 
@@ -150,18 +155,66 @@ export function indexCatalog(api: Record<string, { models?: Record<string, Catal
 
 const score = (model: CatalogModel) => (model.cost ? 2 : 0) + (model.limit?.context ? 1 : 0)
 
-async function catalog(): Promise<Map<string, CatalogModel>> {
+type CatalogApi = Record<string, { models?: Record<string, CatalogModel> }>
+
+/** Path of the on-disk models.dev cache, under `$XDG_CACHE_HOME` (default `~/.cache`). */
+export function cachePath(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.XDG_CACHE_HOME || path.join(os.homedir() || os.tmpdir(), ".cache")
+  return path.join(root, "opencode-dyn-models", "models-dev.json")
+}
+
+type CacheEntry = { timestamp: number; data: CatalogApi }
+
+/** Reads the cached catalog, ignoring a missing, unreadable, or malformed file. */
+export function readCache(file: string): CacheEntry | undefined {
   try {
-    const response = await fetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
-    return indexCatalog((await response.json()) as Record<string, { models?: Record<string, CatalogModel> }>)
-  } catch (error) {
-    console.warn(`[dyn-models] models.dev unavailable, registering without catalog metadata: ${(error as Error).message}`)
-    return new Map()
+    const entry = JSON.parse(fs.readFileSync(file, "utf8")) as CacheEntry
+    return entry && typeof entry.timestamp === "number" && entry.data ? entry : undefined
+  } catch {
+    return undefined
   }
 }
 
-async function load(id: string, options: ProviderOptions, known: Map<string, CatalogModel>): Promise<Loaded | undefined> {
+export function writeCache(file: string, data: CatalogApi, now = Date.now()): void {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(file, JSON.stringify({ timestamp: now, data }), { mode: 0o600 })
+  } catch {
+    // The cache is best-effort; a failure only costs a network fetch next time.
+  }
+}
+
+let catalogPromise: Promise<Map<string, CatalogModel>> | undefined
+
+/** models.dev metadata; one fetch per process, served from disk while it is fresh. */
+export function catalog(): Promise<Map<string, CatalogModel>> {
+  catalogPromise ??= loadCatalog(cachePath())
+  return catalogPromise
+}
+
+export async function loadCatalog(file: string, now = Date.now()): Promise<Map<string, CatalogModel>> {
+  const cached = readCache(file)
+  if (cached && now - cached.timestamp <= CATALOG_TTL) return indexCatalog(cached.data)
+  try {
+    const response = await fetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
+    const data = (await response.json()) as CatalogApi
+    writeCache(file, data, now)
+    return indexCatalog(data)
+  } catch (error) {
+    console.warn(
+      `[dyn-models] models.dev unavailable, using ${cached ? "cached" : "no"} metadata: ${(error as Error).message}`,
+    )
+    return cached ? indexCatalog(cached.data) : new Map()
+  }
+}
+
+async function load(
+  id: string,
+  options: ProviderOptions,
+  known: Map<string, CatalogModel>,
+  signal?: AbortSignal,
+): Promise<Loaded | undefined> {
   const apiKey = resolveEnv(options.apiKey)
   if (options.apiKey && !apiKey) {
     console.warn(`[dyn-models] ${id}: ${options.apiKey} is not set, skipping`)
@@ -171,13 +224,14 @@ async function load(id: string, options: ProviderOptions, known: Map<string, Cat
   const providerID = Provider.ID.make(id)
   const prefix = options.prefix ?? prefixOf(options.name ?? id)
   const filter = { hide: compile(asArray(options.hide)), show: compile(asArray(options.show)) }
+  const timeout = AbortSignal.timeout(30_000)
   const response = await fetch(`${options.baseURL.replace(/\/+$/, "")}/models`, {
     headers: {
       accept: "application/json",
       ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
       ...options.headers,
     },
-    signal: AbortSignal.timeout(30_000),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   })
   if (!response.ok) throw new Error(`models request failed: ${response.status} ${response.statusText}`)
 
@@ -217,22 +271,36 @@ export default Plugin.define({
       return
     }
 
-    const known = await catalog()
-    const loaded = await Promise.all(
-      entries.map(([id, options]) =>
-        load(id, options, known).catch((error: Error) => {
-          console.warn(`[dyn-models] ${id}: ${error.message}`)
-          return undefined
-        }),
-      ),
-    )
-    const ready = loaded.filter((entry): entry is Loaded => entry !== undefined)
-    if (!ready.length) return
-
+    // Discovery runs off the startup path so a slow endpoint or models.dev never delays boot.
+    // The transform replays whatever has loaded so far; one reload after discovery finishes
+    // makes the models visible.
+    let loaded: Loaded[] = []
     await ctx.provider.transform((editor) => {
-      for (const { info, models } of ready) editor.add({ info, models })
+      for (const { info, models } of loaded) editor.add({ info, models })
     })
 
-    console.log(`[dyn-models] ${ready.map(({ info, models }) => `${info.id}: ${models.length} models`).join(", ")}`)
+    const abort = new AbortController()
+    void (async () => {
+      try {
+        const known = await catalog()
+        if (abort.signal.aborted) return
+        const results = await Promise.all(
+          entries.map(([id, options]) =>
+            load(id, options, known, abort.signal).catch((error: Error) => {
+              console.warn(`[dyn-models] ${id}: ${error.message}`)
+              return undefined
+            }),
+          ),
+        )
+        loaded = results.filter((entry): entry is Loaded => entry !== undefined)
+        if (!loaded.length || abort.signal.aborted) return
+        console.log(`[dyn-models] ${loaded.map(({ info, models }) => `${info.id}: ${models.length} models`).join(", ")}`)
+        await ctx.provider.reload()
+      } catch (error) {
+        console.warn(`[dyn-models] discovery failed: ${(error as Error).message}`)
+      }
+    })()
+
+    return () => abort.abort()
   },
 })

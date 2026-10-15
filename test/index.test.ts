@@ -1,6 +1,22 @@
 import { expect, test } from "bun:test"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
 import { Provider } from "@opencode/plugin"
-import { displayId, displayName, indexCatalog, keep, matchKey, prefixOf, resolveEnv, toModel } from "../src/index.js"
+import {
+  cachePath,
+  displayId,
+  displayName,
+  indexCatalog,
+  keep,
+  loadCatalog,
+  matchKey,
+  prefixOf,
+  readCache,
+  resolveEnv,
+  toModel,
+  writeCache,
+} from "../src/index.js"
 
 const filter = (hide: string[] = [], show: string[] = []) => ({
   hide: hide.map((pattern) => new RegExp(pattern, "i")),
@@ -80,4 +96,71 @@ test("indexCatalog prefers the priced entry for one normalized id", () => {
     b: { models: { "deepseek-v4.1-flash": { name: "priced", cost: { input: 1, output: 2 }, limit: { context: 10 } } } },
   })
   expect(index.get("deepseek-v4-1-flash")?.name).toBe("priced")
+})
+
+const tempCache = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "dyn-models-")), "models-dev.json")
+
+test("cachePath honours XDG_CACHE_HOME", () => {
+  expect(cachePath({ XDG_CACHE_HOME: "/tmp/xdg" })).toBe("/tmp/xdg/opencode-dyn-models/models-dev.json")
+})
+
+test("writeCache then readCache round-trips, and a bad file reads as empty", () => {
+  const file = tempCache()
+  writeCache(file, { a: { models: { m: { name: "M" } } } }, 123)
+  expect(readCache(file)).toEqual({ timestamp: 123, data: { a: { models: { m: { name: "M" } } } } })
+
+  fs.writeFileSync(file, "not json")
+  expect(readCache(file)).toBeUndefined()
+  expect(readCache(path.join(os.tmpdir(), "dyn-models-missing.json"))).toBeUndefined()
+})
+
+test("loadCatalog serves a fresh cache without touching the network", async () => {
+  const file = tempCache()
+  writeCache(file, { a: { models: { "deepseek-v4.1-flash": { name: "fresh", cost: { input: 1, output: 2 } } } } }, 1000)
+
+  const original = globalThis.fetch
+  let called = false
+  globalThis.fetch = (async () => {
+    called = true
+    throw new Error("network should not be hit")
+  }) as unknown as typeof fetch
+  try {
+    const known = await loadCatalog(file, 1000 + 60_000)
+    expect(called).toBe(false)
+    expect(known.get("deepseek-v4-1-flash")?.name).toBe("fresh")
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("loadCatalog refetches a stale cache and persists the result", async () => {
+  const file = tempCache()
+  writeCache(file, { a: { models: { old: { name: "old" } } } }, 0)
+
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ a: { models: { fresh: { name: "fresh" } } } }), { status: 200 })) as unknown as typeof fetch
+  try {
+    const known = await loadCatalog(file, 10 * 60 * 60 * 1000)
+    expect(known.get("fresh")?.name).toBe("fresh")
+    expect(readCache(file)?.data).toEqual({ a: { models: { fresh: { name: "fresh" } } } })
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("loadCatalog falls back to a stale cache when the network fails", async () => {
+  const file = tempCache()
+  writeCache(file, { a: { models: { stale: { name: "stale" } } } }, 0)
+
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => {
+    throw new Error("offline")
+  }) as unknown as typeof fetch
+  try {
+    const known = await loadCatalog(file, 10 * 60 * 60 * 1000)
+    expect(known.get("stale")?.name).toBe("stale")
+  } finally {
+    globalThis.fetch = original
+  }
 })
