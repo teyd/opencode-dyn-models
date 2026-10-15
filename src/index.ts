@@ -1,7 +1,7 @@
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Model, Plugin, Provider } from "@opencode/plugin"
+import { Integration, Model, Plugin, Provider } from "@opencode/plugin"
 
 /**
  * One entry in the plugin's `providers` option.
@@ -55,6 +55,55 @@ const asArray = (value?: string | string[]) => (value === undefined ? [] : Array
 /** Replace `{env:NAME}` with the matching environment variable, or nothing when unset. */
 export const resolveEnv = (value?: string, env: NodeJS.ProcessEnv = process.env) =>
   value?.replace(ENV, (_, name: string) => env[name] ?? "")
+
+/** Env variable OpenCode's own connection resolution looks at when the option names none. */
+export const envName = (id: string) => `OPENCODE_LOCAL_${id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`
+
+/** Variables the integration's env method should read. A `{env:NAME}` option wins. */
+export function credentialEnvNames(id: string, apiKey?: string): string[] {
+  const named = [...(apiKey?.matchAll(ENV) ?? [])].map((match) => match[1]).filter((name): name is string => !!name)
+  return [...new Set(named.length ? named : [envName(id)])]
+}
+
+type Integration = Plugin.Context["integration"]
+/** The key discovery would authenticate with, plus where it came from (never the secret itself). */
+export type Credential = { key?: string; identity: string }
+
+/**
+ * The credential OpenCode would use to run this provider: its active connection
+ * (a stored `/connect` key or the `OPENCODE_LOCAL_<ID>_API_KEY` env method), and
+ * only without one the plugin's own `apiKey` option. An OAuth connection is
+ * rejected rather than silently falling back to a different credential.
+ */
+export async function credentialFor(
+  integration: Integration,
+  id: string,
+  options: ProviderOptions,
+): Promise<Credential> {
+  const fallback: Credential = { key: resolveEnv(options.apiKey) || undefined, identity: "options" }
+  let connection
+  try {
+    connection = await integration.connection.active(id)
+  } catch (error) {
+    console.warn(`[dyn-models] ${id}: could not read the active connection: ${(error as Error).message}`)
+    return fallback
+  }
+  if (!connection) return fallback
+
+  try {
+    const value = await integration.connection.resolve(connection)
+    if (value?.type === "key") {
+      const identity = connection.type === "env" ? `env:${connection.name}` : `credential:${connection.id}`
+      return { key: value.key, identity }
+    }
+    if (value) throw new Error("an OAuth connection is not supported for model discovery")
+  } catch (error) {
+    // A stored connection is authoritative: never fall back to another credential for it.
+    if (connection.type === "credential") throw error
+    console.warn(`[dyn-models] ${id}: could not resolve the active connection: ${(error as Error).message}`)
+  }
+  return fallback
+}
 
 /** `Command Code` → `CC`. A single word keeps its first two letters. */
 export function prefixOf(name: string): string {
@@ -210,14 +259,16 @@ export async function loadCatalog(file: string, now = Date.now()): Promise<Map<s
 }
 
 async function load(
+  integration: Integration,
   id: string,
   options: ProviderOptions,
   known: Map<string, CatalogModel>,
   signal?: AbortSignal,
 ): Promise<Loaded | undefined> {
-  const apiKey = resolveEnv(options.apiKey)
-  if (options.apiKey && !apiKey) {
-    console.warn(`[dyn-models] ${id}: ${options.apiKey} is not set, skipping`)
+  const credential = await credentialFor(integration, id, options)
+  const apiKey = credential.key
+  if (!apiKey && options.apiKey) {
+    console.warn(`[dyn-models] ${id}: ${options.apiKey} is not set and no connection is active, skipping`)
     return undefined
   }
 
@@ -255,7 +306,9 @@ async function load(
       name: options.name ?? id,
       activation: "enabled",
       package: options.package ?? DEFAULT_PACKAGE,
-      settings: { baseURL: options.baseURL, ...(apiKey ? { apiKey } : {}) },
+      integrationID: Integration.ID.make(id),
+      // A stored connection authenticates requests itself. Only the options fallback has no account to point at.
+      settings: { baseURL: options.baseURL, ...(credential.identity === "options" && apiKey ? { apiKey } : {}) },
       ...(options.headers ? { headers: options.headers } : {}),
     },
     models,
@@ -274,6 +327,22 @@ export default Plugin.define({
     // Discovery runs off the startup path so a slow endpoint or models.dev never delays boot.
     // The transform replays whatever has loaded so far; one reload after discovery finishes
     // makes the models visible.
+    await ctx.integration.transform((editor) => {
+      for (const [id, options] of entries) {
+        editor.update(id, (integration) => {
+          integration.name = options.name ?? id
+        })
+        editor.method.update({
+          integrationID: id,
+          method: { type: "key", label: "API key" },
+        })
+        editor.method.update({
+          integrationID: id,
+          method: { type: "env", names: credentialEnvNames(id, options.apiKey) },
+        })
+      }
+    })
+
     let loaded: Loaded[] = []
     await ctx.provider.transform((editor) => {
       for (const { info, models } of loaded) editor.add({ info, models })
@@ -286,7 +355,7 @@ export default Plugin.define({
         if (abort.signal.aborted) return
         const results = await Promise.all(
           entries.map(([id, options]) =>
-            load(id, options, known, abort.signal).catch((error: Error) => {
+            load(ctx.integration, id, options, known, abort.signal).catch((error: Error) => {
               console.warn(`[dyn-models] ${id}: ${error.message}`)
               return undefined
             }),

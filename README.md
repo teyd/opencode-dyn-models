@@ -29,6 +29,8 @@ The plugin path must be a directory (OpenCode loads its `index.ts`).
 }
 ```
 
-`show` only brings back a model that `hide` removed. `hide: ["^gpt-"]` and `show: ["luna"]` drops the other GPT models and still lists DeepSeek. Omit `apiKey` for an endpoint that does not need one. `prefix` defaults to the initials of `name` (`Command Code` → `CC`).
+`show` only brings back a model that `hide` removed. `hide: ["^gpt-"]` and `show: ["luna"]` drops the other GPT models and still lists DeepSeek. `prefix` defaults to the initials of `name` (`Command Code` → `CC`).
+
+The key comes from `/connect` or `opencode auth login <id> --method key` when that account is active. Otherwise it comes from the env method (`{env:NAME}` in `apiKey`, or `OPENCODE_LOCAL_<ID>_API_KEY`). `apiKey` is only the fallback.
 
 A provider whose key is unset, or whose `/models` call fails, is skipped. models.dev being down only means names still appear, without prices.

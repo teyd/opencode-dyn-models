@@ -5,6 +5,8 @@ import * as path from "node:path"
 import { Provider } from "@opencode/plugin"
 import {
   cachePath,
+  credentialEnvNames,
+  credentialFor,
   displayId,
   displayName,
   indexCatalog,
@@ -99,6 +101,50 @@ test("indexCatalog prefers the priced entry for one normalized id", () => {
 })
 
 const tempCache = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "dyn-models-")), "models-dev.json")
+
+test("credentialEnvNames prefers the option template", () => {
+  expect(credentialEnvNames("commandcode", "{env:COMMANDCODE_API_KEY}")).toEqual(["COMMANDCODE_API_KEY"])
+  expect(credentialEnvNames("command-code")).toEqual(["OPENCODE_LOCAL_COMMAND_CODE_API_KEY"])
+})
+
+const reader = (active: unknown, value?: unknown) =>
+  ({
+    connection: {
+      active: async () => active,
+      resolve: async () => value,
+    },
+  }) as unknown as Parameters<typeof credentialFor>[0]
+
+test("credentialFor prefers a stored key and otherwise uses the option", async () => {
+  const options = { baseURL: "http://127.0.0.1", apiKey: "{env:COMMANDCODE_API_KEY}" }
+  const stored = await credentialFor(
+    reader({ type: "credential", id: "cred_1" }, { type: "key", key: "stored" }),
+    "commandcode",
+    options,
+  )
+  expect(stored).toEqual({ key: "stored", identity: "credential:cred_1" })
+
+  const env = await credentialFor(
+    reader({ type: "env", name: "COMMANDCODE_API_KEY" }, { type: "key", key: "from-env" }),
+    "commandcode",
+    options,
+  )
+  expect(env.identity).toBe("env:COMMANDCODE_API_KEY")
+
+  const fallback = await credentialFor(reader(undefined), "commandcode", options)
+  expect(fallback.identity).toBe("options")
+  expect(fallback.key).toBeUndefined()
+})
+
+test("credentialFor does not replace a stored OAuth connection with the option", async () => {
+  await expect(
+    credentialFor(
+      reader({ type: "credential", id: "cred_1" }, { type: "oauth", access: "token" }),
+      "commandcode",
+      { baseURL: "http://127.0.0.1", apiKey: "plain" },
+    ),
+  ).rejects.toThrow("OAuth")
+})
 
 test("cachePath honours XDG_CACHE_HOME", () => {
   expect(cachePath({ XDG_CACHE_HOME: "/tmp/xdg" })).toBe("/tmp/xdg/opencode-dyn-models/models-dev.json")
