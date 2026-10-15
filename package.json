@@ -1,0 +1,24 @@
+{
+  "name": "opencode-dyn-models",
+  "version": "0.1.0",
+  "description": "OpenCode v2 plugin: discover a provider's models at startup instead of listing them by hand, with per-provider regex hide lists.",
+  "keywords": ["opencode", "opencode-plugin", "models"],
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src", "README.md"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.0"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.29",
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}
