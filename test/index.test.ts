@@ -10,7 +10,10 @@ import {
   credentialEnvNames,
   credentialFor,
   displayId,
+  disambiguate,
   displayName,
+  prettyName,
+  freshList,
   effortVariants,
   indexCatalog,
   keep,
@@ -67,8 +70,27 @@ test("names drop the vendor prefix and share one tag", () => {
   expect(displayId("Qwen/Qwen3.8-Flash")).toBe("qwen3.8-flash")
   expect(displayId("stealth/glyph-cluster:free")).toBe("glyph-cluster-free")
   expect(prefixOf("Command Code")).toBe("CC")
-  expect(displayName("CC", "deepseek-v4.1-flash")).toBe("[CC] deepseek-v4.1-flash")
+  expect(displayName("CC", "DeepSeek V4.1 Flash")).toBe("[CC] DeepSeek V4.1 Flash")
   expect(matchKey("deepseek-ai/DeepSeek-V4.1-Flash")).toBe(matchKey("deepseek/deepseek-v4.1-flash"))
+})
+
+test("prettyName is the fallback when models.dev has no name", () => {
+  expect(prettyName("deepseek/deepseek-v4.1-flash")).toBe("Deepseek V4.1 Flash")
+  expect(prettyName("qwen2.5-coder-7b-instruct")).toBe("Qwen2.5 Coder 7B Instruct")
+  expect(prettyName("meta/llama-3-8b-q4_k_m")).toBe("Llama 3 8B Q4 K M")
+  expect(prettyName("openai/gpt-oss-20b")).toBe("GPT OSS 20B")
+  expect(prettyName("google/gemma-3-vl")).toBe("Gemma 3 VL")
+})
+
+test("disambiguate suffixes colliding names with the upstream id", () => {
+  const models = [{ name: "[CC] Mini", modelID: "a/mini" }, { name: "[CC] Mini", modelID: "b/mini" }, { name: "[CC] Solo", modelID: "c" }]
+  disambiguate(models, (model) => model.modelID)
+  expect(models.map((model) => model.name)).toEqual(["[CC] Mini (a/mini)", "[CC] Mini (b/mini)", "[CC] Solo"])
+})
+
+test("toModel falls back to a formatted name without a catalog entry", () => {
+  const model = toModel(Provider.ID.make("commandcode"), { id: "deepseek/deepseek-v4.1-flash" }, "CC")
+  expect(model.name).toBe("[CC] Deepseek V4.1 Flash")
 })
 
 test("toModel keeps the upstream id and overlays models.dev", () => {
@@ -78,6 +100,7 @@ test("toModel keeps the upstream id and overlays models.dev", () => {
     { id: "deepseek/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", context_length: 1000000 },
     "CC",
     {
+      name: "DeepSeek V4.1 Flash",
       family: "deepseek",
       tool_call: true,
       release_date: "2026-06-09",
@@ -89,7 +112,7 @@ test("toModel keeps the upstream id and overlays models.dev", () => {
 
   expect(String(model.id)).toBe("deepseek-v4.1-flash")
   expect(String(model.modelID)).toBe("deepseek/deepseek-v4.1-flash")
-  expect(model.name).toBe("[CC] deepseek-v4.1-flash")
+  expect(model.name).toBe("[CC] DeepSeek V4.1 Flash")
   expect(model.limit.output).toBe(128000)
   expect(Number(model.cost[0]?.input)).toBe(0.14)
   expect(Number(model.cost[0]?.cache.read)).toBe(0.01)
@@ -294,6 +317,46 @@ test("loadCatalog falls back to a stale cache when the network fails", async () 
   try {
     const known = await loadCatalog(file, 10 * 60 * 60 * 1000)
     expect(known.get("stale")?.name).toBe("stale")
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("includeBy and excludeBy filter on raw fields, exclude winning", async () => {
+  const { passesRules } = await import("../src/index.js")
+  const rules = {
+    includeBy: [{ field: "id", match: "^(gpt|deepseek)" }],
+    excludeBy: [{ field: "available", equals: false }, { field: "id", match: "image" }],
+  }
+  expect(passesRules({ id: "deepseek-v4" }, rules)).toBe(true)
+  expect(passesRules({ id: "llama" }, rules)).toBe(false)
+  expect(passesRules({ id: "gpt-5", available: false }, rules)).toBe(false)
+  expect(passesRules({ id: "gpt-image-1" }, rules)).toBe(false)
+  expect(passesRules({ id: "anything" }, {})).toBe(true)
+})
+
+test("models cache is reused while fresh and only for the same endpoint", () => {
+  const entry = { timestamp: 1000, baseURL: "https://a/models", list: [{ id: "m" }] }
+  expect(freshList(entry, "https://a/models", 60, 1000 + 59_000)).toEqual([{ id: "m" }])
+  expect(freshList(entry, "https://a/models", 60, 1000 + 61_000)).toBeUndefined()
+  expect(freshList(entry, "https://b/models", 60, 1000)).toBeUndefined()
+  expect(freshList(undefined, "x", 60)).toBeUndefined()
+  expect(freshList({ list: "no" }, "x", 60)).toBeUndefined()
+})
+
+test("loadCatalog honours a custom ttl and url", async () => {
+  const file = tempCache()
+  writeCache(file, { a: { models: { old: { name: "old" } } } }, 0)
+  const original = globalThis.fetch
+  let url = ""
+  globalThis.fetch = (async (input: unknown) => {
+    url = String(input)
+    return new Response(JSON.stringify({ a: { models: { fresh: { name: "fresh" } } } }))
+  }) as unknown as typeof fetch
+  try {
+    const known = await loadCatalog(file, 5_000, { url: "https://mirror.example/api.json", ttlSeconds: 1 })
+    expect(url).toBe("https://mirror.example/api.json")
+    expect(known.get("fresh")?.name).toBe("fresh")
   } finally {
     globalThis.fetch = original
   }

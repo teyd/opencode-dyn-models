@@ -7,13 +7,13 @@ import { Integration, Model, Plugin, Provider } from "@opencode/plugin"
  * One entry in the plugin's `providers` option.
  *
  * At startup the plugin calls `GET {baseURL}/models` with the API key, drops
- * anything matching `hide`, and registers the rest. Limits, price, and tool
- * support come from models.dev when the model is in that catalog.
+ * anything matching `hide`, and registers the rest. Names, limits, price, tool
+ * support and effort levels come from models.dev when the model is in that catalog.
  */
 export type ProviderOptions = {
   /** Display name. Defaults to the provider id. Also used to build `prefix`. */
   name?: string
-  /** Short tag in model names, e.g. `CC` → `[CC] deepseek-v4.1-flash`. Defaults to the initials of `name`. */
+  /** Short tag in model names, e.g. `CC` → `[CC] DeepSeek V4.1 Flash`. Defaults to the initials of `name`. */
   prefix?: string
   /** Base URL of the OpenAI-compatible API, without a trailing `/models`. */
   baseURL: string
@@ -28,15 +28,33 @@ export type ProviderOptions = {
   /** Regexes that un-hide a model already matched by `hide`. They do not hide anything else. */
   show?: string | string[]
   /**
-   * Effort levels offered as variants on reasoning models, sent as `reasoning_effort`.
-   * Defaults to the levels models.dev lists for each model (else `["low", "medium", "high"]`); `false` turns variants off.
+   * Replaces the models.dev effort levels on models already flagged as reasoning,
+   * sent as `reasoning_effort`. It does not flag models by itself; use `reasoning` for that.
+   * `false` turns variants off.
    */
   effort?: string[] | false
   /** Regexes of models that get effort levels even when models.dev does not flag them as reasoning models. */
   reasoning?: string | string[]
+  /** Path of the models list, relative to `baseURL`. Defaults to `/models`. */
+  endpoint?: string
+  /** Timeout for the models request in milliseconds. Defaults to 30000. */
+  timeoutMs?: number
+  /** Keep only models whose raw field matches one of these rules. Applied before `hide`/`show`. */
+  includeBy?: FieldRule[]
+  /** Drop models whose raw field matches one of these rules. Wins over `includeBy`. */
+  excludeBy?: FieldRule[]
+  /** Reuse the last `/models` response on disk instead of requesting it on every start. Off by default. */
+  cache?: { enabled?: boolean; ttlSeconds?: number }
 }
 
-export type Options = { providers?: Record<string, ProviderOptions> }
+/** A test on one top-level field of a raw `/models` entry: `match` is a regex, `equals` is strict equality. */
+export type FieldRule = { field: string; match?: string; equals?: unknown }
+
+export type Options = {
+  providers?: Record<string, ProviderOptions>
+  /** The models.dev catalog: a mirror URL and how long the on-disk copy stays fresh. */
+  catalog?: { url?: string; ttlSeconds?: number }
+}
 
 type Loaded = { info: Provider.Info; models: Model.Info[] }
 
@@ -141,6 +159,30 @@ export function displayName(prefix: string, id: string) {
   return `[${prefix}] ${id}`
 }
 
+const ACRONYMS = new Set(["gpt", "oss", "api", "gguf", "ggml", "vl", "mlx", "moe", "tts", "stt", "asr", "ocr"])
+
+function titleCase(token: string): string {
+  const lower = token.toLowerCase()
+  if (ACRONYMS.has(lower) || /^\d+b$/i.test(token) || /^q\d+$/i.test(token)) return token.toUpperCase()
+  if (/^\d+\.\d+/.test(token)) return token
+  return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase()
+}
+
+/** Readable name from a raw id, used when models.dev has none: `deepseek/deepseek-v4.1-flash` → `Deepseek V4.1 Flash`. */
+export function prettyName(rawId: string): string {
+  const tail = rawId.split("/").pop() ?? rawId
+  return tail.split(/[-_]+/).filter(Boolean).map(titleCase).join(" ") || rawId
+}
+
+/** Suffix models whose names collide with their upstream id, so the picker never shows two identical rows. */
+export function disambiguate<T extends { name: string }>(models: T[], label: (model: T) => string): void {
+  const counts = new Map<string, number>()
+  for (const model of models) counts.set(model.name, (counts.get(model.name) ?? 0) + 1)
+  for (const model of models) {
+    if ((counts.get(model.name) ?? 0) > 1) model.name = `${model.name} (${label(model)})`
+  }
+}
+
 /** Next URL for a redirect, or an error when it leaves the current origin. */
 export function nextSameOrigin(current: string, location: string): string {
   const next = new URL(location, current)
@@ -190,6 +232,26 @@ function compile(patterns: string[]): RegExp[] {
 export function keep(model: { id: string; name: string }, filter: { hide: RegExp[]; show: RegExp[] }) {
   const hit = (patterns: RegExp[]) => patterns.some((pattern) => pattern.test(model.id) || pattern.test(model.name))
   return !hit(filter.hide) || hit(filter.show)
+}
+
+/** Whether a raw entry satisfies a field rule. A rule with neither `match` nor `equals` never hits. */
+export function ruleHits(entry: Record<string, unknown>, rule: FieldRule): boolean {
+  const value = entry[rule.field]
+  if ("equals" in rule && rule.equals !== undefined) return value === rule.equals
+  if (rule.match === undefined || typeof value !== "string") return false
+  try {
+    return new RegExp(rule.match, "i").test(value)
+  } catch (error) {
+    warn(`ignoring invalid pattern ${JSON.stringify(rule.match)}: ${(error as Error).message}`)
+    return false
+  }
+}
+
+/** `includeBy` (when set) must match, then `excludeBy` must not. */
+export function passesRules(entry: Record<string, unknown>, options: Pick<ProviderOptions, "includeBy" | "excludeBy">): boolean {
+  const { includeBy, excludeBy } = options
+  if (includeBy?.length && !includeBy.some((rule) => ruleHits(entry, rule))) return false
+  return !excludeBy?.some((rule) => ruleHits(entry, rule))
 }
 
 const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined)
@@ -243,7 +305,7 @@ export function toModel(
     ...base,
     id: Model.ID.make(id),
     modelID: Model.ID.make(upstream),
-    name: displayName(prefix, id),
+    name: displayName(prefix, catalog?.name?.trim() || prettyName(upstream)),
     family: catalog?.family as Model.Info["family"],
     capabilities: {
       tools: catalog?.tool_call ?? base.capabilities.tools,
@@ -327,16 +389,36 @@ export function writeCache(file: string, data: CatalogApi, now = Date.now()): vo
 let catalogPromise: Promise<Map<string, CatalogModel>> | undefined
 
 /** models.dev metadata; one fetch per process, served from disk while it is fresh. */
-export function catalog(): Promise<Map<string, CatalogModel>> {
-  catalogPromise ??= loadCatalog(cachePath())
+export function catalog(settings: CatalogSettings = {}): Promise<Map<string, CatalogModel>> {
+  catalogPromise ??= loadCatalog(cachePath(), Date.now(), settings)
   return catalogPromise
 }
 
-export async function loadCatalog(file: string, now = Date.now()): Promise<Map<string, CatalogModel>> {
+export type CatalogSettings = { url?: string; ttlSeconds?: number }
+
+export type ModelsCache = { timestamp: number; baseURL: string; list: unknown[] }
+
+/** Plugin-scoped durable storage, as `ctx.storage` provides it. */
+export type Store = {
+  get(key: string): Promise<unknown>
+  set(key: string, value: never): Promise<void>
+}
+
+/** A cached list, only when it is fresh and was fetched from the same endpoint. */
+export function freshList(entry: unknown, key: string, ttlSeconds: number, now = Date.now()): unknown[] | undefined {
+  const cached = entry as Partial<ModelsCache> | undefined
+  if (!cached || cached.baseURL !== key || !Array.isArray(cached.list) || typeof cached.timestamp !== "number") return undefined
+  return now - cached.timestamp <= ttlSeconds * 1000 ? cached.list : undefined
+}
+
+export const modelsKey = (id: string) => `models/${id}`
+
+export async function loadCatalog(file: string, now = Date.now(), settings: CatalogSettings = {}): Promise<Map<string, CatalogModel>> {
   const cached = readCache(file)
-  if (cached && now - cached.timestamp <= CATALOG_TTL) return indexCatalog(cached.data)
+  const ttl = settings.ttlSeconds !== undefined ? settings.ttlSeconds * 1000 : CATALOG_TTL
+  if (cached && now - cached.timestamp <= ttl) return indexCatalog(cached.data)
   try {
-    const response = await pinnedFetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
+    const response = await pinnedFetch(settings.url ?? CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
     const data = (await response.json()) as CatalogApi
     writeCache(file, data, now)
@@ -353,6 +435,8 @@ async function load(
   options: ProviderOptions,
   known: Map<string, CatalogModel>,
   signal?: AbortSignal,
+  store?: Store,
+  force = false,
 ): Promise<Loaded | undefined> {
   const credential = await credentialFor(integration, id, options)
   const apiKey = credential.key
@@ -369,28 +453,36 @@ async function load(
     disabled: options.effort === false,
     force: compile(asArray(options.reasoning)),
   }
-  const timeout = AbortSignal.timeout(30_000)
-  const secrets = [apiKey, ...Object.values(options.headers ?? {})]
-  let response: Response
-  try {
-    response = await pinnedFetch(`${options.baseURL.replace(/\/+$/, "")}/models`, {
-      headers: {
-        accept: "application/json",
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-        ...options.headers,
-      },
-      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-    })
-  } catch (error) {
-    throw new Error(redact((error as Error).message, secrets))
-  }
-  if (!response.ok) throw new Error(`models request failed: ${response.status} ${response.statusText}`)
+  const endpoint = `${options.baseURL.replace(/\/+$/, "")}/${(options.endpoint ?? "/models").replace(/^\/+/, "")}`
+  const cacheOn = options.cache?.enabled === true && !!store
+  const ttl = options.cache?.ttlSeconds ?? 86_400
+  let list = cacheOn && !force ? freshList(await store!.get(modelsKey(id)).catch(() => undefined), endpoint, ttl) : undefined
+  if (!list) {
+    const timeout = AbortSignal.timeout(options.timeoutMs ?? 30_000)
+    const secrets = [apiKey, ...Object.values(options.headers ?? {})]
+    let response: Response
+    try {
+      response = await pinnedFetch(endpoint, {
+        headers: {
+          accept: "application/json",
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+          ...options.headers,
+        },
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      })
+    } catch (error) {
+      throw new Error(redact((error as Error).message, secrets))
+    }
+    if (!response.ok) throw new Error(`models request failed: ${response.status} ${response.statusText}`)
 
-  const body = (await response.json()) as { data?: unknown[] } | unknown[]
-  const list = Array.isArray(body) ? body : (body.data ?? [])
+    const body = (await response.json()) as { data?: unknown[] } | unknown[]
+    list = Array.isArray(body) ? body : (body.data ?? [])
+    if (cacheOn) await store!.set(modelsKey(id), { timestamp: Date.now(), baseURL: endpoint, list } as never).catch(() => undefined)
+  }
   const used = new Set<string>()
   const models = list
     .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object" && typeof (entry as { id?: unknown }).id === "string")
+    .filter((entry) => passesRules(entry, options))
     .filter((entry) => keep({ id: String(entry.id), name: String(entry.name ?? entry.id) }, filter))
     .map((entry) => {
       let slug = displayId(String(entry.id))
@@ -399,6 +491,7 @@ async function load(
       return toModel(providerID, entry, prefix, known.get(matchKey(String(entry.id))), slug, effort)
     })
   if (!models.length) throw new Error("no models left, check your hide/show patterns")
+  disambiguate(models, (model) => String(model.modelID))
 
   return {
     info: {
@@ -415,6 +508,9 @@ async function load(
   }
 }
 
+/** Summary line for a discovery run, e.g. `commandcode: 12 models`. */
+export const summary = (loaded: Loaded[]) => loaded.map(({ info, models }) => `${info.id}: ${models.length} models`).join(", ")
+
 export default Plugin.define({
   id: "opencode-dyn-models",
   async setup(ctx) {
@@ -425,8 +521,7 @@ export default Plugin.define({
     }
 
     // Discovery runs off the startup path so a slow endpoint or models.dev never delays boot.
-    // The transform replays whatever has loaded so far; one reload after discovery finishes
-    // makes the models visible.
+    // The transform replays whatever has loaded so far; a reload after discovery makes the models visible.
     await ctx.integration.transform((editor) => {
       for (const [id, options] of entries) {
         editor.update(id, (integration) => {
@@ -449,27 +544,90 @@ export default Plugin.define({
     })
 
     const abort = new AbortController()
-    void (async () => {
-      try {
-        const known = await catalog()
-        if (abort.signal.aborted) return
+    const store = ctx.storage as unknown as Store
+    let running: Promise<string> = Promise.resolve("")
+
+    /** One discovery pass over `only` (or every provider). Runs are serialized; `force` skips the models cache. */
+    const discover = (force: boolean, only?: string, signal: AbortSignal = abort.signal): Promise<string> => {
+      running = running.then(async () => {
+        if (signal.aborted) return "cancelled"
+        const known = await catalog((ctx.options.catalog ?? {}) as CatalogSettings)
+        const wanted = entries.filter(([id]) => !only || id === only)
         const results = await Promise.all(
-          entries.map(([id, options]) =>
-            load(ctx.integration, id, options, known, abort.signal).catch((error: Error) => {
+          wanted.map(([id, options]) =>
+            load(ctx.integration, id, options, known, signal, store, force).catch((error: Error) => {
               warn(`${id}: ${error.message}`)
               return undefined
             }),
           ),
         )
-        loaded = results.filter((entry): entry is Loaded => entry !== undefined)
-        if (!loaded.length || abort.signal.aborted) return
-        console.log(`[dyn-models] ${loaded.map(({ info, models }) => `${info.id}: ${models.length} models`).join(", ")}`)
-        await ctx.provider.reload()
+        const fresh = results.filter((entry): entry is Loaded => entry !== undefined)
+        if (signal.aborted) return "cancelled"
+        // Providers outside this run keep their previous models.
+        const kept = loaded.filter(({ info }) => !wanted.some(([id]) => id === info.id))
+        loaded = [...kept, ...fresh]
+        if (fresh.length) await ctx.provider.reload()
+        const text = fresh.length ? summary(fresh) : "no models loaded, see the log"
+        console.log(`[dyn-models] ${text}`)
+        return text
+      })
+      running = running.catch((error: Error) => {
+        warn(`discovery failed: ${error.message}`)
+        return `discovery failed: ${error.message}`
+      })
+      return running
+    }
+
+    void discover(false)
+
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "refresh",
+        description: "Re-fetch the model list of the dyn-models providers, bypassing the models cache.",
+        input: {
+          type: "object",
+          properties: { provider: { type: "string", description: "Provider id. Omit to refresh all." } },
+          additionalProperties: false,
+        },
+        options: { namespace: "dyn_models" },
+        execute: async (input, context) => {
+          const only = (input as { provider?: string }).provider
+          if (only && !entries.some(([id]) => id === only)) return { content: `unknown provider ${only}` }
+          return { content: await discover(true, only, AbortSignal.any([abort.signal, context.signal])) }
+        },
+      })
+    })
+
+    await ctx.command.transform((editor) => {
+      editor.add({
+        name: "dyn-models-refresh",
+        description: "Re-fetch dyn-models provider model lists",
+        execute: async ({ sessionID, prompt }) => {
+          const text = await discover(true, prompt.text.trim() || undefined)
+          await ctx.session.synthetic({ sessionID, text: `dyn-models: ${text}` })
+        },
+      })
+    })
+
+    // A new or switched credential can unblock a skipped provider; the models cache keeps this cheap.
+    const events = new AbortController()
+    let pending: ReturnType<typeof setTimeout> | undefined
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: events.signal })) {
+          if (event.type !== "credential.updated" && event.type !== "credential.switched") continue
+          clearTimeout(pending)
+          pending = setTimeout(() => void discover(false), 500)
+        }
       } catch (error) {
-        warn(`discovery failed: ${(error as Error).message}`)
+        if (!events.signal.aborted) warn(`event stream stopped: ${(error as Error).message}`)
       }
     })()
 
-    return () => abort.abort()
+    return () => {
+      clearTimeout(pending)
+      events.abort()
+      abort.abort()
+    }
   },
 })
